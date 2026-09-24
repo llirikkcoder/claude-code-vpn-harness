@@ -86,27 +86,64 @@ vpn_start() {
 
 vpn_stop() {
   log "Stopping openvpn..."
-  # MUST match the sudoers entry byte-for-byte: `pkill -f openvpn` (no extra
-  # args) — sudoers does exact-string command matching, so any different
-  # invocation silently prompts for a password instead of running.
-  sudo -n pkill -f openvpn 2>/dev/null || true
+  # killall first, on purpose. It matches the *process name* only, so it hits
+  # the daemon and nothing else.
+  #
+  # `pkill -f openvpn` matches the whole command line, and that is genuinely
+  # dangerous here: the very command running it ("… pkill -f openvpn") contains
+  # the string, and so does any unrelated command that merely mentions openvpn —
+  # a grep, a tail of the log, an agent's own diagnostic call. Two failures seen
+  # in practice: an agent's command was killed mid-run, and the elevation
+  # wrapper was killed before the daemon was, leaving the daemon alive while
+  # the script reported success. That orphan then held the single per-cert
+  # session for two days and blocked a second machine from connecting.
+  #
+  # pkill stays as a fallback only, for the case where killall is unavailable.
+  # Both forms are allowlisted in sudoers (see README → Setup).
+  sudo -n killall openvpn 2>/dev/null || true
   sleep 1
   rm -f "$PID_FILE"
   if vpn_running; then
-    sudo -n killall openvpn 2>/dev/null || true
+    sudo -n pkill -f openvpn 2>/dev/null || true
     sleep 1
   fi
   vpn_running && err "openvpn still running — stop it manually: sudo killall openvpn" || log "✓ VPN stopped"
+}
+
+# A daemon left over from an earlier run holds the VPN server's single
+# per-certificate session, so a second machine cannot connect: the two clients
+# evict each other in a loop. Nothing in the UI shows this — the tunnel was
+# raised outside the VPN client app — so it goes unnoticed for days.
+warn_if_orphaned() {
+  vpn_running || return 0
+  [ -s "$PID_FILE" ] && return 0   # our own run, PID file still present
+  log "Note: an openvpn daemon for '$PROFILE_TAG' is already running, started"
+  log "      outside this script (no PID file). It will be left as is."
+  log "      If a second machine cannot connect, stop it: sudo killall openvpn"
+}
+
+# openvpn --log-append never truncates; the file grew to 8 MB over a few days
+# of an orphaned daemon. Keep one previous copy and start clean.
+rotate_log() {
+  [ -f "$LOG_FILE" ] || return 0
+  local size
+  size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+  [ "$size" -gt 1048576 ] || return 0
+  mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+  log "Rotated VPN log (was $((size / 1024)) KB) → $(basename "$LOG_FILE").1"
 }
 
 WE_STARTED_VPN=0
 cleanup() { [ "$WE_STARTED_VPN" = 1 ] && [ -z "${KEEP_VPN:-}" ] && vpn_stop; }
 trap cleanup EXIT INT TERM
 
+warn_if_orphaned
+
 if vpn_reachable; then
   log "Target already reachable — no VPN needed"
 else
   log "Target unreachable — bringing up VPN"
+  rotate_log
   vpn_start
   WE_STARTED_VPN=1
   elapsed=0
